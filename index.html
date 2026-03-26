@@ -403,103 +403,125 @@ function compute() {
   document.getElementById('pempty').style.display=any?'none':'block';
   if(!any) return;
 
-  // Per-metric 100m projections via table lookup
-  const ef10=fly10?tinterp('fly10',fly10):null;
-  const et300p=t300p?tinterp('t300p',t300p):null;
-  const ef20=fly20?tinterp('fly20',fly20):null;
-  const ef30=fly30?tinterp('fly30',fly30):null;
-  const et30=t30?tinterp('t30',t30):null;
-  const et50=t50?tinterp('t50',t50):null;
-  const et60=t60?tinterp('t60',t60):null;
-  const et120=t120?tinterp('t120',t120):null;
-  const et150=t150?tinterp('t150',t150):null;
-  const bestFly=ef20??ef10??ef30;
+  // ── STEP 1: PER-METRIC 100m ESTIMATES ──────────────────────
+  const ef10  = fly10  ? tinterp('fly10',  fly10)  : null;
+  const ef20  = fly20  ? tinterp('fly20',  fly20)  : null;
+  const ef30  = fly30  ? tinterp('fly30',  fly30)  : null;
+  const et30  = t30    ? tinterp('t30',    t30)    : null;
+  const et50  = t50    ? tinterp('t50',    t50)    : null;
+  const et60  = t60    ? tinterp('t60',    t60)    : null;
+  const et120 = t120   ? tinterp('t120',   t120)   : null;
+  const et150 = t150   ? tinterp('t150',   t150)   : null;
+  const et300p= t300p  ? tinterp('t300p',  t300p)  : null;
+  const bestFly = ef20 ?? ef10 ?? ef30;
 
-  // ── PHYSICS-BASED WEIGHTING ──
-  // MaxV (fly) = hard ceiling — highest weight
-  // 60m = best single predictor (captures accel + speed onset)
-  // 150m = speed endurance signal (critical for 200m/400m profiles)
-  // 120m = speed endurance (secondary)
-  // 50m = acceleration quality
-  // 30m = pure acceleration (lowest — misleads on accel-dominant athletes)
-  // Weights per framework: MaxV=40%, Accel=40%, Endurance=20% for 100m
-  // But endurance inputs strongly adjust 200m/400m projections separately
-  const t100c = wmean([
-    [bestFly, 0.30], [et60,   0.28], [et150,  0.14],
-    [et120,   0.10], [et300p, 0.08], [et50,   0.07], [et30, 0.04]
-  ]);
-  // Endurance-adjusted 200m: if endurance metrics project SLOWER than MaxV, penalize 200m
-  const endurEst = wmean([[et150,0.5],[et120,0.3],[et300p,0.2]]);
-  const vmaxEst  = wmean([[bestFly,0.6],[et60,0.4]]);
-  // endurGap > 0 means endurance projects slower than speed → athlete will fade in 200m
-  const endurGap = (endurEst !== null && vmaxEst !== null) ? endurEst - vmaxEst : 0;
-  // Endurance-penalized 200m projection
-  const t200_endur_adj = t100c ? fromT100(t100c + Math.max(0, endurGap * 0.4), 't200') : null;
-  // Endurance-penalized 400m projection  
-  const t400_endur_adj = t100c ? fromT100(t100c + Math.max(0, endurGap * 0.6), 't400') : null;
+  // ── STEP 2: BUILD COMPONENT SCORES ──────────────────────────
+  // Each score = implied 100m time from that component
+  // Lower = faster/better in that quality
+  const vmaxScore  = wmean([[ef10,0.3],[ef20,0.5],[ef30,0.2]].filter(p=>p[0]!==null));
+  const accelScore = wmean([[et30,0.3],[et50,0.4],[et60,0.3]].filter(p=>p[0]!==null));
+  // Speed endurance: 150m and 120m are primary, 300p supports 400m specifically
+  const seScore    = wmean([[et150,0.55],[et120,0.45]].filter(p=>p[0]!==null));
+  const spEndScore = et300p; // special endurance — 300m practice only
 
-  // All event projections from master table
-  const t200c = t200_endur_adj ?? (t100c ? fromT100(t100c,'t200') : null);
-  const t300c = t100c ? fromT100(t100c,'t300') : null;
-  const t400c = t400_endur_adj ?? (t100c ? fromT100(t100c,'t400') : null);
+  // Vmax in m/s
+  const vmVals = [[fly10,10],[fly20,20],[fly30,30]].filter(p=>p[0]).map(p=>p[1]/p[0]);
+  const vmBest = vmVals.length ? vmVals.reduce((a,b)=>a+b)/vmVals.length : null;
 
-  // Vmax from fly
-  const vmVals=[[fly10,10],[fly20,20],[fly30,30]].filter(p=>p[0]).map(p=>p[1]/p[0]);
-  const vmBest=vmVals.length?vmVals.reduce((a,b)=>a+b)/vmVals.length:null;
+  // ── STEP 3: VELOCITY DROP-OFF (DECAY MODEL) ──────────────────
+  // dropOff = how much slower endurance projects vs MaxV ceiling
+  // Positive = athlete decelerates more = poor speed endurance
+  // Negative = athlete holds speed = good endurance
+  const dropOff = (vmaxScore !== null && seScore !== null) ? seScore - vmaxScore : null;
+  const accelGap = (accelScore !== null && vmaxScore !== null) ? vmaxScore - accelScore : null;
+  // Decay rate as % (how much velocity is lost relative to MaxV)
+  const decayPct = (dropOff !== null && vmaxScore !== null)
+    ? Math.round((dropOff / vmaxScore) * 100)
+    : null;
 
-  // ── ATHLETE PROFILE CLASSIFICATION ──
-  // Compare fly-implied t100 (hard ceiling) vs endurance-implied t100
-  // Speed reserve = gap between MaxV ceiling and endurance floor
-  const flyOnly = wmean([[ef10,0.3],[ef20,0.5],[ef30,0.2]].filter(p=>p[0]!==null));
-  const endurOnly = wmean([[et120,0.45],[et150,0.55]].filter(p=>p[0]!==null));
-  const accelOnly = wmean([[et30,0.35],[et50,0.65]].filter(p=>p[0]!==null));
-
-  // Speed reserve: how much faster is MaxV ceiling vs endurance ceiling
-  // Positive = endurance worse than MaxV (speed dominant, poor endurance)
-  // Negative = endurance better than MaxV (endurance dominant)
-  const speedReserve = (flyOnly!==null && endurOnly!==null) ? flyOnly-endurOnly : null;
-  // Accel gap: how much faster does acceleration project vs MaxV
-  const accelGap = (accelOnly!==null && flyOnly!==null) ? flyOnly-accelOnly : null;
-
-  // Determine sprint profile
+  // ── STEP 4: ATHLETE CLASSIFICATION ───────────────────────────
   let profile = 'balanced';
-  if (speedReserve!==null && speedReserve > 0.25) profile = 'speed_dominant';
-  else if (speedReserve!==null && speedReserve < -0.20) profile = 'endurance_dominant';
-  if (accelGap!==null && accelGap < -0.25) profile = 'accel_dominant';
-  else if (accelGap!==null && accelGap > 0.25 && profile==='balanced') profile = 'topspeed_dominant';
+  if      (dropOff !== null && dropOff > 0.35) profile = 'speed_dominant';
+  else if (dropOff !== null && dropOff < -0.20) profile = 'endurance_dominant';
+  if      (accelGap !== null && accelGap < -0.30) profile = 'accel_dominant';
+  else if (accelGap !== null && accelGap > 0.30 && profile === 'balanced') profile = 'topspeed_dominant';
 
-  // Profile-adjusted 200m/400m projections
-  // Pure speed guy: 200m closer to 2.04-2.05x, drops off more on 400m
-  // Endurance/long sprinter: 200m closer to 1.98-2.0x, holds better on 400m
+  // ── STEP 5: 100m — MaxV ceiling dominates (45-50%), Accel 35-40%, Endurance 10-15%
+  // Dynamically weight based on what inputs are available
+  const t100c = wmean([
+    [vmaxScore,  0.45],
+    [accelScore !== null ? wmean([[et60,0.5],[et50,0.3],[et30,0.2]].filter(p=>p[0]!==null)) : null, 0.38],
+    [seScore,    0.12],
+    [et300p,     0.05],
+  ]);
+
+  // ── STEP 6: SEPARATE PROJECTIONS FOR EACH EVENT ──────────────
+  // Each event uses its own weighting of the component scores
+  // 200m: Accel 22%, MaxV 33%, Speed Endurance 35%, Special Endurance 10%
+  // 300m: primarily from table (anchored to 150m + 300p inputs)
+  // 400m: Accel 7%, MaxV 18%, Speed Endurance 28%, Special Endurance 47%
+  //       → 300p and 150m are the PRIMARY 400m predictors, NOT fly times
+
+  // 200m weighted projection
+  const t200w = wmean([
+    [vmaxScore  !== null ? fromT100(vmaxScore,  't200') : null, 0.33],
+    [accelScore !== null ? fromT100(accelScore, 't200') : null, 0.22],
+    [seScore    !== null ? fromT100(seScore,    't200') : null, 0.35],
+    [spEndScore !== null ? fromT100(spEndScore, 't200') : null, 0.10],
+  ]);
+
+  // 400m weighted projection — 300p and 150m carry the most weight
+  // fly/accel inputs carry almost no weight for 400m
+  const t400w = wmean([
+    [spEndScore !== null ? fromT100(spEndScore, 't400') : null, 0.47],
+    [seScore    !== null ? fromT100(seScore,    't400') : null, 0.28],
+    [vmaxScore  !== null ? fromT100(vmaxScore,  't400') : null, 0.18],
+    [accelScore !== null ? fromT100(accelScore, 't400') : null, 0.07],
+  ]);
+
+  // 300m — speed endurance + special endurance weighted
+  const t300w = wmean([
+    [seScore    !== null ? fromT100(seScore,    't300') : null, 0.45],
+    [spEndScore !== null ? fromT100(spEndScore, 't300') : null, 0.35],
+    [vmaxScore  !== null ? fromT100(vmaxScore,  't300') : null, 0.20],
+  ]);
+
+  // Fall back to table lookup from t100c if component scores unavailable
+  const t200c = t200w ?? (t100c ? fromT100(t100c, 't200') : null);
+  const t300c = t300w ?? (t100c ? fromT100(t100c, 't300') : null);
+  const t400c = t400w ?? (t100c ? fromT100(t100c, 't400') : null);
+
+  // Dynamic endurance penalty on 200m/400m if decay detected
+  // Only apply when we have enough data to confirm the pattern
   let t200adj = t200c, t400adj = t400c;
-  if (profile==='speed_dominant' && t100c) {
-    t200adj = t100c * 2.04;  // speed-dominant athlete fades more in 200m
-    t400adj = t200adj * 2 + 5.5;  // bigger acidosis penalty
-  } else if (profile==='endurance_dominant' && t100c) {
-    t200adj = t100c * 1.99;  // endurance athlete holds better
-    t400adj = t200adj * 2 + 3.5;  // better special endurance
+  if (dropOff !== null && dropOff > 0.15 && t100c) {
+    // Athlete fades — penalize longer events proportionally to decay
+    const pen200 = Math.min(dropOff * 0.35, 0.8); // cap at 0.8s penalty
+    const pen400 = Math.min(dropOff * 0.70, 2.0); // cap at 2.0s penalty
+    t200adj = t200c !== null ? t200c + pen200 : t200c;
+    t400adj = t400c !== null ? t400c + pen400 : t400c;
   }
+  const endurGap = dropOff ?? 0;
 
   // Speed profile cards
   document.getElementById('spd').innerHTML=[
     vmBest?`<div class="mc"><div class="ml">Vmax (ceiling)</div><div class="mv">${vmBest.toFixed(2)}</div><div class="mn">m/s — hard speed limit</div></div>`:'',
     fly10?`<div class="mc"><div class="ml">Vmax via 10m Fly</div><div class="mv">${(10/fly10).toFixed(2)}</div><div class="mn">m/s</div></div>`:'',
     fly20?`<div class="mc"><div class="ml">Vmax via 20m Fly</div><div class="mv">${(20/fly20).toFixed(2)}</div><div class="mn">m/s — most reliable</div></div>`:'',
-    fly30?`<div class="mc"><div class="ml">Vmax via 30m Fly</div><div class="mv">${(30/fly30).toFixed(2)}</div><div class="mn">m/s — ceiling predictor</div></div>`:'',
-    speedReserve!==null?`<div class="mc"><div class="ml">Speed Reserve</div><div class="mv">${speedReserve>=0?'+':''}${speedReserve.toFixed(2)}</div><div class="mn">${speedReserve>0.15?'Speed-dominant':'speed reserve gap'}</div></div>`:'',
+    fly30?`<div class="mc"><div class="ml">Vmax via 30m Fly</div><div class="mv">${(30/fly30).toFixed(2)}</div><div class="mn">m/s</div></div>`:'',
+    dropOff!==null?`<div class="mc"><div class="ml">Velocity Drop-off</div><div class="mv" style="color:${dropOff>0.35?'var(--red)':dropOff>0.15?'var(--amber)':'var(--green)'}">${dropOff>=0?'+':''}${dropOff.toFixed(2)}s</div><div class="mn">${decayPct!==null?decayPct+'% decay rate':''}</div></div>`:'',
   ].join('');
 
-  // Breakdown table
   const rows=[
-    {l:'10m Fly (MaxV ceiling)',         e:ef10,  note:'Hard speed limit — primary ceiling (32%)'},
-    {l:'20m Fly (MaxV maintenance)',      e:ef20,  note:'MaxV maintenance — most reliable'},
-    {l:'30m Fly (ceiling predictor)',     e:ef30,  note:'Best 100m ceiling predictor'},
-    {l:'30m w/ RT (acceleration)',        e:et30,  note:'Pure acceleration (5% weight)'},
-    {l:'50m w/ RT (accel + speed)',       e:et50,  note:'Accel + early top speed (9%)'},
-    {l:'60m w/ RT (best predictor)',      e:et60,  note:'Best single predictor — accel+speed (26%)'},
-    {l:'120m @95% (speed endurance)',     e:et120, note:'Speed endurance (12%)'},
-    {l:'150m @95% (speed endurance)',     e:et150, note:'Speed endurance + 200m predictor (15%)'},
-    {l:'300m @95% practice rep',           e:et300p,note:'400m anchor — special endurance (6%)'},
+    {l:'10m Fly',                         e:ef10,   note:'MaxV ceiling — 45% of 100m'},
+    {l:'20m Fly',                         e:ef20,   note:'MaxV maintenance — most reliable'},
+    {l:'30m Fly',                         e:ef30,   note:'Best ceiling predictor'},
+    {l:'30m w/ RT',                       e:et30,   note:'Acceleration — 35% of 100m'},
+    {l:'50m w/ RT',                       e:et50,   note:'Accel + early speed'},
+    {l:'60m w/ RT',                       e:et60,   note:'Accel score anchor'},
+    {l:'120m @95% (mean)',                e:et120,  note:'Speed endurance — 35% of 200m, 28% of 400m'},
+    {l:'150m @95% (mean)',                e:et150,  note:'Speed endurance — primary 200m/400m predictor'},
+    {l:'300m @95% practice',              e:et300p, note:'Special endurance — 47% of 400m projection'},
   ].filter(r=>r.e!==null);
 
   let html=`<table class="bt"><thead><tr><th>Metric</th><th>100m</th><th>200m</th><th>300m</th><th>400m</th><th>vs Consensus</th></tr></thead><tbody>`;
@@ -517,49 +539,50 @@ function compute() {
 
   document.getElementById('rcards').innerHTML=`
     <div class="pc y"><div class="lbl">100m Projection</div><div class="val">${fmt(t100c)}</div>
-      <div class="sub">MaxV+60m weighted</div>
+      <div class="sub">MaxV 45% · Accel 38% · Endurance 12%</div>
       <div class="rng">${t100c?'Range: '+((t100c-.08).toFixed(2))+'&ndash;'+((t100c+.12).toFixed(2)):''}</div></div>
     <div class="pc g"><div class="lbl">200m Projection</div><div class="val">${fmt(t200adj??t200c,1)}</div>
-      <div class="sub">Endurance-adjusted projection</div>
-      <div class="rng" style="color:var(--amber);font-size:9px">${endurGap>0.25?'Poor speed endurance detected — 200m penalized':endurGap>0.10?'Average speed endurance':'Good speed endurance profile'}</div></div>
+      <div class="sub">MaxV 33% · Accel 22% · SE 35% · SpE 10%</div>
+      <div class="rng" style="color:${endurGap>0.35?'var(--red)':endurGap>0.15?'var(--amber)':'var(--green)'};font-size:9px">${endurGap>0.35?'High decay — 200m penalized '+((endurGap*0.35).toFixed(1))+'s':endurGap>0.15?'Moderate decay detected':'Good speed endurance'}</div></div>
     <div class="pc b"><div class="lbl">300m Projection</div><div class="val">${fmt(t300c,1)}</div>
-      <div class="sub">From master table</div></div>
+      <div class="sub">SE 45% · SpE 35% · MaxV 20%</div></div>
     <div class="pc t"><div class="lbl">400m Projection</div><div class="val">${fmt(t400adj??t400c,1)}</div>
-      <div class="sub">${profile==='speed_dominant'?'200x2+5.5s (speed fades)':profile==='endurance_dominant'?'200x2+3.5s (holds well)':'From master table'}</div></div>`;
+      <div class="sub">SpE 47% · SE 28% · MaxV 18% · Accel 7%</div>
+      <div class="rng" style="font-size:9px;color:var(--muted)">${!et300p&&!et150?'Enter 300m/150m for 400m accuracy':''}</div></div>`;
 
   // Archetype
   const archetypes = {
     'speed_dominant': {
       name:'Speed / Short Sprinter',color:'var(--green)',
-      desc:`MaxV ceiling (${flyOnly?flyOnly.toFixed(2):'--'}s projected) is significantly faster than your speed endurance (${endurOnly?endurOnly.toFixed(2):'--'}s projected). You have elite top-end speed but fade in the back half due to lower lactic tolerance. Strong 100m potential; 200m/400m will drop off more than average. Speed reserve gap: ${speedReserve>=0?'+':''}${speedReserve?.toFixed(2)??'--'}s. Priority: speed endurance work (3x150m, 4x120m), aerobic base.`,
+      desc:`MaxV ceiling projects ${vmaxScore?vmaxScore.toFixed(2):'--'}s but speed endurance projects ${seScore?seScore.toFixed(2):'--'}s — a ${dropOff?dropOff.toFixed(2):'--'}s gap (${decayPct??'?'}% decay rate). High top-end speed but you fade in the back half. Your 200m and 400m suffer disproportionately. Priority: speed endurance (3x150m, 4x120m) and aerobic base.`,
       events:'Best: 100m, 4x100m relay'
     },
     'endurance_dominant': {
       name:'Endurance / Long Sprinter',color:'var(--teal)',
-      desc:`Speed endurance (${endurOnly?endurOnly.toFixed(2):'--'}s projected) is proportionally better than your MaxV ceiling (${flyOnly?flyOnly.toFixed(2):'--'}s projected). You hold pace well and have strong aerobic power. 200m and 400m will outperform your 100m. Priority: raise the Vmax ceiling — flying sprint development, max velocity sessions.`,
+      desc:`Speed endurance projects ${seScore?seScore.toFixed(2):'--'}s — better than your MaxV ceiling of ${vmaxScore?vmaxScore.toFixed(2):'--'}s. You hold velocity well. 200m and 400m will outperform your raw 100m. Priority: raise the Vmax ceiling — max velocity sessions, flying 30m+ sprints.`,
       events:'Best: 200m, 400m, 4x400m'
     },
     'accel_dominant': {
       name:'Acceleration Dominant',color:'var(--amber)',
-      desc:`Your 30m/50m (${accelOnly?accelOnly.toFixed(2):'--'}s projected) outpaces your fly/60m (${flyOnly?flyOnly.toFixed(2):'--'}s projected) by ${accelGap?Math.abs(accelGap).toFixed(2):'--'}s. Strong drive phase, but top-end speed is the current limit. Race times track closest to fly/60m projection. Priority: max velocity development — flying 30m+ sprints, wickets, overspeed.`,
+      desc:`Acceleration projects ${accelScore?accelScore.toFixed(2):'--'}s but MaxV ceiling is ${vmaxScore?vmaxScore.toFixed(2):'--'}s — strong drive phase, top-end speed is the limiter. Race times track closest to fly/60m projection. Priority: max velocity development — flying sprints 30m+, wickets.`,
       events:'Best: Relay lead-off, 60m indoor'
     },
     'topspeed_dominant': {
       name:'Top-Speed Dominant',color:'var(--green)',
-      desc:`Fly metrics project ${accelGap?accelGap.toFixed(2):'--'}s faster than your 30m/50m. Elite top-end speed, block mechanics are currently limiting. Priority: drive phase force production, 0-30m sled/resistance work, block mechanics.`,
+      desc:`MaxV ceiling (${vmaxScore?vmaxScore.toFixed(2):'--'}s) is ahead of acceleration (${accelScore?accelScore.toFixed(2):'--'}s). Elite top-end speed, block mechanics limiting. Priority: drive phase force production, 0-30m sled work, block mechanics.`,
       events:'Best: 100m (as starts improve), 200m'
     },
     'balanced': {
       name:'Balanced / Developing',color:'var(--purple)',
-      desc:`Well-rounded profile — all three qualities (acceleration, MaxV, speed endurance) are proportionally matched. Most common for developing athletes. Highest leverage: MaxV development. Raising Vmax is the hard ceiling — it lifts potential in all events.`,
+      desc:`Well-rounded profile — MaxV, acceleration and speed endurance are proportionally matched. Highest leverage: MaxV development. Vmax is the hard ceiling — raising it lifts potential in every event.`,
       events:'Best: 100m, 200m, 4x100m relay'
     }
   };
 
   const arch = archetypes[profile];
   const vmaxSc = vmBest?Math.max(5,Math.min(95,(vmBest-8.5)/2.8*100)):50;
-  const acSc = accelGap!==null?Math.max(5,Math.min(95,50-accelGap*25)):50;
-  const enSc = speedReserve!==null?Math.max(5,Math.min(95,50-speedReserve*20)):50;
+  const acSc = accelGap!==null?Math.max(5,Math.min(95,50+accelGap*25)):50;
+  const enSc = dropOff!==null?Math.max(5,Math.min(95,50-dropOff*20)):50;
   const bars=[
     {l:'Acceleration (30m/50m)',v:Math.round(acSc), c:'var(--gold)'},
     {l:'Max Velocity (fly)',    v:Math.round(vmaxSc),c:'var(--green)'},
@@ -580,7 +603,8 @@ function compute() {
   document.getElementById('conf').innerHTML=`
     <div style="margin-bottom:6px">Confidence: <span style="color:${cl};font-weight:500">${ec>=5?'HIGH':ec>=3?'MODERATE':'LOW'}</span> &mdash; ${ec}/9 metrics entered</div>
     <div>MaxV (fly) = hard ceiling (32% weight). 60m = best predictor (26%). Speed endurance weighted 28% combined.</div>
-    <div>200m/400m projections penalized when endurance metrics (150m/120m/300m) project slower than speed metrics. Endurance is 40% of 200m, 70% of 400m.</div>
+    <div>400m uses 150m + 300m practice as PRIMARY predictors (75% weight). Fly times carry only 18% for 400m.</div>
+    <div>200m/400m penalized dynamically based on measured velocity decay rate. Enter 150m + 300m practice for accurate longer event projections.</div>
     <div>120m/150m = mean of ALL reps, 8-12 min full recovery. Hand timing: add ~0.24s before entering start times.</div>`;
 }
 
